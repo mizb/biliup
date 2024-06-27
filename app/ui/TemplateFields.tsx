@@ -6,7 +6,7 @@ import useSWR from "swr";
 import {BiliType, fetcher, StudioEntity} from "../lib/api-streamer";
 import {useBiliUsers, useTypeTree} from "../lib/use-streamers";
 
-const TemplateFields: React.FC<FormFCChild> = ({ formState, formApi, values }) => {
+const TemplateFields: React.FC<FormFCChild<StudioEntity & {isDtime: boolean}>> = ({ formState, formApi, values }) => {
     const { Section, Input, DatePicker, TimePicker, Select, Switch, InputNumber, Checkbox, CheckboxGroup, RadioGroup, Radio, Cascader, TagInput, TextArea } = Form;
     const { Text } = Typography;
     const { typeTree, isError, isLoading } = useTypeTree();
@@ -34,7 +34,7 @@ const TemplateFields: React.FC<FormFCChild> = ({ formState, formApi, values }) =
         <Input field='dynamic' label='粉丝动态' style={{ width: 464 }} />
         <Form.Select
             field="uploader"
-            label='上传插件'
+            label='上传插件' initValue={values.uploader ?? 'biliup-rs'}
             style={{ width: 250 }} showClear>
             <Form.Select.Option value="bili_web">bili_web</Form.Select.Option>
             <Form.Select.Option value="biliup-rs">biliup-rs</Form.Select.Option>
@@ -122,19 +122,20 @@ const TemplateFields: React.FC<FormFCChild> = ({ formState, formApi, values }) =
                     field="copyright"
                     label='类型'
                     direction='vertical'
-                    // initValue={1}
+                    initValue={formApi.getValue('copyright') ?? 2}
+                    extraText={
+                        <div style={{fontSize: 14}}>
+                            如不填写转载来源默认为直播间地址
+                        </div>
+                    }
                 >
-                    <div onClick={()=>formApi.setValue('source', '')}>
+                    <Radio value={2} style={{alignItems: 'center', flexShrink: 0}} >
+                        <span style={{flexShrink: 0}}>转载</span>
+                        <Input field='copyright_source' onClick={()=>formApi.setValue('copyright', 2)} placeholder="转载视频请注明来源（例：转自http://www.xx.com/yy）注明来源会更快地通过审核哦" noLabel fieldStyle={{padding: 0, marginLeft: 24, width: 560}} />
+                    </Radio>
+                    <div onClick={()=>formApi.setValue('copyright_source', '')}>
                         <Radio value={1}>自制</Radio>
                     </div>
-                    <Radio value={2} style={{alignItems: 'center', flexShrink: 0}}>
-                        <span style={{flexShrink: 0}}>转载</span>
-                        {/* <div > */}
-                        <Input field='source' onClick={()=>formApi.setValue('copyright', 2)} placeholder="转载视频请注明来源（例：转自http://www.xx.com/yy）注明来源会更快地通过审核哦" noLabel fieldStyle={{padding: 0, marginLeft: 24, width: 560}}/>
-                        {/* </div> */}
-
-                        {/* <Form.DatePicker type='dateTimeRange' noLabel field='customTime'/> */}
-                    </Radio>
                 </RadioGroup>
                 <Cascader
                     field="tid"
@@ -153,7 +154,9 @@ const TemplateFields: React.FC<FormFCChild> = ({ formState, formApi, values }) =
                     field="tags"
                     label='标签'
                     allowDuplicates={false}
-                    placeholder='输入标签，Enter 确定'
+                    addOnBlur={true}
+                    separator=','
+                    placeholder="可用英文逗号分隔以批量输入标签，失焦/Enter 以保存"
                     onChange={v => console.log(v)}
                     style={{width: 560}}
                     rules={[

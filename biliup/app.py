@@ -5,17 +5,20 @@ from concurrent.futures import ThreadPoolExecutor
 from . import plugins
 from biliup.config import config
 from biliup.engine import Plugin, invert_dict
-from biliup.engine.event import EventManager
+from biliup.engine.event import EventManager, Event
 from .common.timer import Timer
+from .common.tools import NamedLock
+
 logger = logging.getLogger('biliup')
 
+
 def create_event_manager():
-    pool1_size = config.get('pool1_size', 3)
+    pool1_size = config.get('pool1_size', 5)
     pool2_size = config.get('pool2_size', 3)
     pool = {
         'Asynchronous1': ThreadPoolExecutor(pool1_size, thread_name_prefix='Asynchronous1'),
         'Asynchronous2': ThreadPoolExecutor(pool2_size, thread_name_prefix='Asynchronous2'),
-        'Asynchronous3': ThreadPoolExecutor(2, thread_name_prefix='Asynchronous3'),
+        # 'Asynchronous3': ThreadPoolExecutor(2, thread_name_prefix='Asynchronous3'),
     }
     # 初始化事件管理器
     app = EventManager(config, pool)
@@ -24,13 +27,26 @@ def create_event_manager():
     app.context['upload_filename'] = []
     return app
 
+
 event_manager = create_event_manager()
 context = event_manager.context
 
 
+async def singleton_check(platform, name, url):
+    from biliup.handler import PRE_DOWNLOAD, UPLOAD
+    context['url_upload_count'].setdefault(url, 0)
+    if context['PluginInfo'].url_status[url] == 1:
+        logger.debug(f'{url} 正在下载中，跳过检测')
+        return
+
+    event_manager.send_event(Event(UPLOAD, ({'name': name, 'url': url},)))
+    if await platform(name, url).acheck_stream(True):
+        # 需要等待上传文件列表检索完成后才可以开始下次下载
+        with NamedLock(f'upload_file_list_{name}'):
+            event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, url,)))
+
+
 async def shot(event):
-    from biliup.engine.event import Event
-    from biliup.handler import CHECK
     index = 0
     while True:
         if not len(event.url_list):
@@ -40,8 +56,14 @@ async def shot(event):
             index = 0
             continue
         cur = event.url_list[index]
-        event_manager.send_event(Event(CHECK, (event, context['PluginInfo'].inverted_index[cur], cur)))
-        index += 1
+        try:
+            await singleton_check(event, context['PluginInfo'].inverted_index[cur], cur)
+            index += 1
+            skip = context['PluginInfo'].url_status[cur] == 1 and index < len(event.url_list)
+            if skip:  # 在一次 url_list 内，如果 url 正在下载，则跳过本次等待以加快下一个检测
+                continue
+        except Exception:
+            logger.exception('shot')
         await asyncio.sleep(config.get('event_loop_interval', 30))
 
 
@@ -64,10 +86,10 @@ class PluginInfo:
         else:
             temp.url_list = [url]
             self.checker[key] = temp
-            from .plugins.twitch import Twitch
-            if temp == Twitch:
-                # 如果支持批量检测，目前只有一个支持，第一版先写死按照特例处理
-                self.batch_check_task()
+            from .engine.download import BatchCheck
+            if issubclass(temp, BatchCheck):
+                # 如果支持批量检测
+                self.batch_check_task(temp)
             else:
                 self.coroutines[key] = asyncio.create_task(shot(temp))
         self.inverted_index[url] = name
@@ -90,22 +112,30 @@ class PluginInfo:
             del self.coroutines[exec_del]
 
     def init_tasks(self):
-        from .engine.download import DownloadBase
-        from .plugins.twitch import Twitch
+        from .engine.download import BatchCheck
 
         for key, plugin in self.checker.items():
-            if plugin == Twitch:
-                # 如果支持批量检测，目前只有一个支持，第一版先写死按照特例处理
-                self.batch_check_task()
+            if issubclass(plugin, BatchCheck):
+                # 如果支持批量检测
+                self.batch_check_task(plugin)
                 continue
             self.coroutines[key] = asyncio.create_task(shot(plugin))
 
-    def batch_check_task(self):
-        from biliup.engine.event import Event
-        from biliup.handler import CHECK
-        from .plugins.twitch import Twitch
+    def batch_check_task(self, plugin):
+        from biliup.handler import PRE_DOWNLOAD
 
         async def check_timer():
-            event_manager.send_event(Event(CHECK, (Twitch, None, None)))
+            name = None
+            # 如果支持批量检测
+            try:
+                async for turl in plugin.abatch_check(plugin.url_list):
+                    context['url_upload_count'].setdefault(turl, 0)
+                    for k, v in config['streamers'].items():
+                        if v.get("url", "") == turl:
+                            name = k
+                    event_manager.send_event(Event(PRE_DOWNLOAD, args=(name, turl,)))
+            except Exception:
+                logger.exception('batch_check_task')
+
         timer = Timer(func=check_timer, interval=30)
-        self.coroutines[Twitch.__name__] = asyncio.create_task(timer.astart())
+        self.coroutines[plugin.__name__] = asyncio.create_task(timer.astart())

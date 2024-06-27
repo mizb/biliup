@@ -1,16 +1,12 @@
 import useSWR from "swr";
-import useSWRMutation from 'swr/mutation';
 
 import {
-  addTemplate,
   BiliType,
   fetcher,
   LiveStreamerEntity, proxy,
-  requestDelete,
-  sendRequest,
   User
 } from "./api-streamer";
-import React, {useEffect, useState} from "react";
+import {useEffect, useState} from "react";
 
 
 export default function useStreamers() {
@@ -32,7 +28,7 @@ export function useBiliUsers() {
     const updateList = async (item: User) => {
       try {
         const res = await fetcher(`/bili/space/myinfo?user=${item.value}`, undefined);
-        const pRes = await proxy(`/bili/proxy?url=${res.data.face}`);
+        const pRes = await proxy(`/bili/proxy?url=${res.data?.face}`);
         const myBlob = await pRes.blob();
 
         return {

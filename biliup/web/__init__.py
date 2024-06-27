@@ -1,14 +1,19 @@
+import asyncio
 import socket
 import json
 import os
 import pathlib
+import concurrent.futures
+import threading
 
 import aiohttp_cors
 import requests
 import stream_gears
 from aiohttp import web
+from aiohttp.client import ClientSession
 from sqlalchemy import select, update
 from sqlalchemy.exc import NoResultFound, MultipleResultsFound
+from urllib.parse import urlparse, unquote
 
 import biliup.common.reload
 from biliup.config import config
@@ -17,6 +22,12 @@ from .aiohttp_basicauth_middleware import basic_auth_middleware
 from biliup.database.db import SessionLocal
 from biliup.database.models import UploadStreamers, LiveStreamers, Configuration, StreamerInfo
 from ..app import logger
+
+try:
+    from importlib.resources import files
+except ImportError:
+    # Try backported to PY<37 `importlib_resources`.
+    from importlib_resources import files
 
 BiliBili = BiliBili(Data())
 
@@ -124,34 +135,36 @@ async def sms_send(request):
     pass
 
 
+@routes.get('/v1/get_qrcode')
 async def qrcode_get(request):
-    if config.data.get("toml"):
-        try:
-            r = eval(stream_gears.get_qrcode())
-        except Exception as e:
-            return web.HTTPBadRequest(text="get qrcode failed")
-    else:
-        r = BiliBili.get_qrcode()
+    try:
+        r = eval(stream_gears.get_qrcode())
+    except Exception as e:
+        return web.HTTPBadRequest(text="get qrcode failed")
     return web.json_response(r)
 
 
+pool = concurrent.futures.ProcessPoolExecutor()
+
+
+@routes.post('/v1/login_by_qrcode')
 async def qrcode_login(request):
     post_data = await request.json()
-    if config.data.get("toml"):
-        try:
-            if stream_gears.login_by_qrcode(json.dumps(post_data)):
-                return web.json_response({"status": 200})
-        except Exception as e:
-            return web.HTTPBadRequest(text="login failed" + str(e))
-    else:
-        try:
-            r = await BiliBili.login_by_qrcode(post_data)
-        except:
-            return web.HTTPBadRequest(text="timeout for qrcode validate")
-        for cookie in r['data']['cookie_info']['cookies']:
-            config.data['user']['cookies'][cookie['name']] = cookie['value']
-        config.data['user']['access_token'] = r['data']['token_info']['access_token']
-        return web.json_response(r)
+    try:
+        loop = asyncio.get_event_loop()
+        # loop
+        task = loop.run_in_executor(pool, stream_gears.login_by_qrcode, (json.dumps(post_data, )))
+        res = await asyncio.wait_for(task, 180)
+        data = json.loads(res)
+        filename = f'data/{data["token_info"]["mid"]}.json'
+        with open(filename, 'w', encoding='utf-8') as file:
+            file.write(res)
+        return web.json_response({
+            'filename': filename
+        })
+    except Exception as e:
+        logger.exception('login_by_qrcode')
+        return web.HTTPBadRequest(text="login failed" + str(e))
 
 
 async def pre_archive(request):
@@ -189,17 +202,17 @@ async def streamers(request):
 @routes.get('/v1/streamer-info')
 async def streamers(request):
     res = []
-    db = request['db']
-    result = db.scalars(select(StreamerInfo))
-    for s_info in result:
-        streamer_info = s_info.as_dict()
-        streamer_info['files'] = []
-        for file in s_info.filelist:
-            tmp = file.as_dict()
-            del tmp['streamer_info_id']
-            streamer_info['files'].append(tmp)
-        streamer_info['date'] = int(streamer_info['date'].timestamp())
-        res.append(streamer_info)
+    with SessionLocal() as db:
+        result = db.scalars(select(StreamerInfo))
+        for s_info in result:
+            streamer_info = s_info.as_dict()
+            streamer_info['files'] = []
+            for file in s_info.filelist:
+                tmp = file.as_dict()
+                del tmp['streamer_info_id']
+                streamer_info['files'].append(tmp)
+            streamer_info['date'] = int(streamer_info['date'].timestamp())
+            res.append(streamer_info)
     return web.json_response(res)
 
 
@@ -207,21 +220,21 @@ async def streamers(request):
 async def streamers(request):
     from biliup.app import context
     res = []
-    db = request['db']
-    result = db.scalars(select(LiveStreamers))
-    for ls in result:
-        temp = ls.as_dict()
-        url = temp['url']
-        status = 'Idle'
-        if context['PluginInfo'].url_status.get(url) == 1:
-            status = 'Working'
-        if context['url_upload_count'].get(url, 0) > 0:
-            status = 'Inspecting'
-        temp['status'] = status
-        if temp.get("upload_streamers_id"):  # 返回 upload_id 而不是 upload_streamers
-            temp["upload_id"] = temp["upload_streamers_id"]
-        temp.pop("upload_streamers_id")
-        res.append(temp)
+    with SessionLocal() as db:
+        result = db.scalars(select(LiveStreamers))
+        for ls in result:
+            temp = ls.as_dict()
+            url = temp['url']
+            status = 'Idle'
+            if context['PluginInfo'].url_status.get(url) == 1:
+                status = 'Working'
+            if context['url_upload_count'].get(url, 0) > 0:
+                status = 'Inspecting'
+            temp['status'] = status
+            if temp.get("upload_streamers_id"):  # 返回 upload_id 而不是 upload_streamers
+                temp["upload_id"] = temp["upload_streamers_id"]
+            temp.pop("upload_streamers_id")
+            res.append(temp)
     return web.json_response(res)
 
 
@@ -230,22 +243,22 @@ async def add_lives(request):
     from biliup.app import context
     json_data = await request.json()
     uid = json_data.get('upload_id')
-    db = request['db']
-    if uid:
-        us = db.get(UploadStreamers, uid)
-        to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data), upload_streamers_id=us.id)
-    else:
-        to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data))
-    try:
-        db.add(to_save)
-        db.commit()
+    with SessionLocal() as db:
+        if uid:
+            us = db.get(UploadStreamers, uid)
+            to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data), upload_streamers_id=us.id)
+        else:
+            to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data))
+        try:
+            db.add(to_save)
+            db.commit()
         # db.flush(to_save)
-    except Exception as e:
-        logger.exception("Error handling request")
-        return web.HTTPBadRequest(text=str(e))
-    config.load_from_db(db)
-    context['PluginInfo'].add(json_data['remark'], json_data['url'])
-    return web.json_response(to_save.as_dict())
+        except Exception as e:
+            logger.exception("Error handling request")
+            return web.HTTPBadRequest(text=str(e))
+        config.load_from_db(db)
+        context['PluginInfo'].add(json_data['remark'], json_data['url'])
+        return web.json_response(to_save.as_dict())
 
 
 @routes.put('/v1/streamers')
@@ -253,65 +266,68 @@ async def lives(request):
     from biliup.app import context
     json_data = await request.json()
     # old = LiveStreamers.get_by_id(json_data['id'])
-    db = request['db']
-    old = db.get(LiveStreamers, json_data['id'])
-    old_url = old.url
-    uid = json_data.get('upload_id')
-    try:
-        if uid:
-            # us = UploadStreamers.get_by_id(json_data['upload_id'])
-            us = db.get(UploadStreamers, json_data['upload_id'])
-            # LiveStreamers.update(**json_data, upload_streamers=us).where(LiveStreamers.id == old.id).execute()
-            # db.update_live_streamer(**{**json_data, "upload_streamers_id": us.id})
-            db.execute(update(LiveStreamers), [{**json_data, "upload_streamers_id": us.id}])
-            db.commit()
-        else:
-            # LiveStreamers.update(**json_data).where(LiveStreamers.id == old.id).execute()
-            db.execute(update(LiveStreamers), [json_data])
-            db.commit()
-    except Exception as e:
-        return web.HTTPBadRequest(text=str(e))
-    config.load_from_db(db)
-    context['PluginInfo'].delete(old_url)
-    context['PluginInfo'].add(json_data['remark'], json_data['url'])
-    # return web.json_response(LiveStreamers.get_dict(id=json_data['id']))
-    return web.json_response(db.get(LiveStreamers, json_data['id']).as_dict())
+    with SessionLocal() as db:
+        old = db.get(LiveStreamers, json_data['id'])
+        old_url = old.url
+        uid = json_data.get('upload_id')
+        # semi-ui 不能直接为 ArrayField 设置空默认值
+        # 当前端更新后，应移除这里的数据修改
+        new_data = {key: json_data.get(key, None) for key in old.as_dict() if key != 'upload_streamers_id'}
+        try:
+            if uid:
+                # us = UploadStreamers.get_by_id(json_data['upload_id'])
+                us = db.get(UploadStreamers, json_data['upload_id'])
+                # LiveStreamers.update(**json_data, upload_streamers=us).where(LiveStreamers.id == old.id).execute()
+                # db.update_live_streamer(**{**json_data, "upload_streamers_id": us.id})
+                db.execute(update(LiveStreamers), [{**new_data, "upload_streamers_id": us.id}])
+                db.commit()
+            else:
+                # LiveStreamers.update(**json_data).where(LiveStreamers.id == old.id).execute()
+                db.execute(update(LiveStreamers), [new_data])
+                db.commit()
+        except Exception as e:
+            return web.HTTPBadRequest(text=str(e))
+        config.load_from_db(db)
+        context['PluginInfo'].delete(old_url)
+        context['PluginInfo'].add(json_data['remark'], json_data['url'])
+        # return web.json_response(LiveStreamers.get_dict(id=json_data['id']))
+        return web.json_response(db.get(LiveStreamers, json_data['id']).as_dict())
 
 
 @routes.delete('/v1/streamers/{id}')
 async def streamers(request):
     from biliup.app import context
     # org = LiveStreamers.get_by_id(request.match_info['id'])
-    db = request['db']
-    org = db.get(LiveStreamers, request.match_info['id'])
+    with SessionLocal() as db:
+        org = db.get(LiveStreamers, request.match_info['id'])
     # LiveStreamers.delete_by_id(request.match_info['id'])
-    db.delete(org)
-    db.commit()
-    context['PluginInfo'].delete(org.url)
+        db.delete(org)
+        db.commit()
+        context['PluginInfo'].delete(org.url)
     return web.HTTPOk()
 
 
 @routes.get('/v1/upload/streamers')
 async def get_streamers(request):
-    db = request['db']
-    res = db.scalars(select(UploadStreamers))
-    return web.json_response([resp.as_dict() for resp in res])
+    with SessionLocal() as db:
+        res = db.scalars(select(UploadStreamers))
+        return web.json_response([resp.as_dict() for resp in res])
 
 
 @routes.get('/v1/upload/streamers/{id}')
 async def streamers_id(request):
-    id = request.match_info['id']
-    db = request['db']
-    res = db.get(UploadStreamers, id).as_dict()
-    return web.json_response(res)
+    _id = request.match_info['id']
+    with SessionLocal() as db:
+        res = db.get(UploadStreamers, _id).as_dict()
+        return web.json_response(res)
 
 
 @routes.delete('/v1/upload/streamers/{id}')
 async def streamers(request):
-    db = request['db']
-    us = db.get(UploadStreamers, request.match_info['id'])
-    db.delete(us)
-    db.commit()
+    with SessionLocal() as db:
+        us = db.get(UploadStreamers, request.match_info['id'])
+        db.delete(us)
+        db.commit()
     # UploadStreamers.delete_by_id(request.match_info['id'])
     return web.HTTPOk()
 
@@ -319,48 +335,49 @@ async def streamers(request):
 @routes.post('/v1/upload/streamers')
 async def streamers_post(request):
     json_data = await request.json()
-    db = request['db']
-    if "id" in json_data.keys():  # 前端未区分更新和新建, 暂时从后端区分
-        db.execute(update(UploadStreamers), [json_data])
-        id = json_data["id"]
-    else:
-        to_save = UploadStreamers(**UploadStreamers.filter_parameters(json_data))
-        db.add(to_save)
+    with SessionLocal() as db:
+        if "id" in json_data.keys():  # 前端未区分更新和新建, 暂时从后端区分
+            db.execute(update(UploadStreamers), [json_data])
+            id = json_data["id"]
+        else:
+            to_save = UploadStreamers(**UploadStreamers.filter_parameters(json_data))
+            db.add(to_save)
+            db.commit()
+            id = to_save.id
         db.commit()
-        id = to_save.id
-    db.commit()
-    config.load_from_db(db)
-    # res = to_save.as_dict()
-    # return web.json_response(res)
-    return web.json_response(db.get(UploadStreamers, id).as_dict())
+        config.load_from_db(db)
+        # res = to_save.as_dict()
+        # return web.json_response(res)
+        return web.json_response(db.get(UploadStreamers, id).as_dict())
 
 
 @routes.put('/v1/upload/streamers')
 async def streamers_put(request):
     json_data = await request.json()
-    db = request['db']
+    with SessionLocal() as db:
     # UploadStreamers.update(**json_data)
-    db.execute(update(UploadStreamers), [json_data])
-    db.commit()
-    config.load_from_db(db)
-    # return web.json_response(UploadStreamers.get_dict(id=json_data['id']))
-    return web.json_response(db.get(UploadStreamers, json_data['id']).as_dict())
+        db.execute(update(UploadStreamers), [json_data])
+        db.commit()
+        config.load_from_db(db)
+        # return web.json_response(UploadStreamers.get_dict(id=json_data['id']))
+        return web.json_response(db.get(UploadStreamers, json_data['id']).as_dict())
 
 
 @routes.get('/v1/users')
 async def users(request):
     # records = Configuration.select().where(Configuration.key == 'bilibili-cookies')
-    db = request['db']
-    records = db.scalars(
-        select(Configuration).where(Configuration.key == 'bilibili-cookies'))
     res = []
-    for record in records:
-        res.append({
-            'id': record.id,
-            'name': record.value,
-            'value': record.value,
-            'platform': record.key,
-        })
+    with SessionLocal() as db:
+        records = db.scalars(
+            select(Configuration).where(Configuration.key == 'bilibili-cookies'))
+
+        for record in records:
+            res.append({
+                'id': record.id,
+                'name': record.value,
+                'value': record.value,
+                'platform': record.key,
+            })
     return web.json_response(res)
 
 
@@ -368,27 +385,27 @@ async def users(request):
 async def users(request):
     json_data = await request.json()
     to_save = Configuration(key=json_data['platform'], value=json_data['value'])
-    db = request['db']
-    db.add(to_save)
-    # to_save.save()
-    # db.flush(to_save)
-    resp = {
-        'id': to_save.id,
-        'name': to_save.value,
-        'value': to_save.value,
-        'platform': to_save.key,
-    }
-    db.commit()
-    return web.json_response([resp])
+    with SessionLocal() as db:
+        db.add(to_save)
+        # to_save.save()
+        # db.flush(to_save)
+        resp = {
+            'id': to_save.id,
+            'name': to_save.value,
+            'value': to_save.value,
+            'platform': to_save.key,
+        }
+        db.commit()
+        return web.json_response([resp])
 
 
 @routes.delete('/v1/users/{id}')
 async def users(request):
     # Configuration.delete_by_id(request.match_info['id'])
-    db = request['db']
-    configuration = db.get(Configuration, request.match_info['id'])
-    db.delete(configuration)
-    db.commit()
+    with SessionLocal() as db:
+        configuration = db.get(Configuration, request.match_info['id'])
+        db.delete(configuration)
+        db.commit()
     return web.HTTPOk()
 
 
@@ -396,49 +413,60 @@ async def users(request):
 async def users(request):
     try:
         # record = Configuration.get(Configuration.key == 'config')
-        db = request['db']
-        record = db.execute(
-            select(Configuration).where(Configuration.key == 'config')
-        ).scalar_one()
+        with SessionLocal() as db:
+            record = db.execute(
+                select(Configuration).where(Configuration.key == 'config')
+            ).scalar_one()
+            return web.json_response(json.loads(record.value))
     except NoResultFound:
         return web.json_response({})
     except MultipleResultsFound as e:
         return web.json_response({"status": 500, 'error': f"有多个空间配置同时存在: {e}"}, status=500)
-    return web.json_response(json.loads(record.value))
+
 
 
 @routes.put('/v1/configuration')
 async def users(request):
     json_data = await request.json()
-    db = request['db']
-    try:
-        # record = Configuration.get(Configuration.key == 'config')
-        record = db.execute(
-            select(Configuration).where(Configuration.key == 'config')
-        ).scalar_one()  # 判断是否只有一行空间配置
-        record.value = json.dumps(json_data)
-        # db.flush(record)
-        resp = record.as_dict()
-        # to_save = Configuration(key='config', value=json.dumps(json_data), id=record.id)
-    except NoResultFound:  # 如果数据库中没有空间配置行，新建
-        to_save = Configuration(key='config', value=json.dumps(json_data))
-        # to_save.save()
-        db.add(to_save)
+    with SessionLocal() as db:
+        try:
+            # record = Configuration.get(Configuration.key == 'config')
+            record = db.execute(
+                select(Configuration).where(Configuration.key == 'config')
+            ).scalar_one()  # 判断是否只有一行空间配置
+            record.value = json.dumps(json_data)
+            # db.flush(record)
+            resp = record.as_dict()
+            # to_save = Configuration(key='config', value=json.dumps(json_data), id=record.id)
+        except NoResultFound:  # 如果数据库中没有空间配置行，新建
+            to_save = Configuration(key='config', value=json.dumps(json_data))
+            # to_save.save()
+            db.add(to_save)
+            db.commit()
+            # db.flush(to_save)
+            resp = to_save.as_dict()
+        except MultipleResultsFound as e:  # 如果有多行，报错
+            return web.json_response({"status": 500, 'error': f"有多个空间配置同时存在: {e}"}, status=500)
         db.commit()
-        # db.flush(to_save)
-        resp = to_save.as_dict()
-    except MultipleResultsFound as e:  # 如果有多行，报错
-        return web.json_response({"status": 500, 'error': f"有多个空间配置同时存在: {e}"}, status=500)
-    db.commit()
-    config.load_from_db(db)
+        config.load_from_db(db)
     return web.json_response(resp)
+
+
+@routes.post('/v1/uploads')
+async def m_upload(request):
+    from ..uploader import biliup_uploader
+    json_data = await request.json()
+    json_data['params']['uploader'] = 'stream_gears'
+    json_data['params']['name'] = json_data['params']['template_name']
+    threading.Thread(target=biliup_uploader, args=(json_data['files'], json_data['params'])).start()
+    return web.json_response({'status': 'ok'})
 
 
 @routes.post('/v1/dump')
 async def dump_config(request):
     json_data = await request.json()
-    db = request['db']
-    config.load_from_db(db)
+    with SessionLocal() as db:
+        config.load_from_db(db)
     file = config.dump(json_data['path'])
     return web.json_response({'path': file})
 
@@ -449,7 +477,7 @@ async def app_status(request):
     from biliup.config import Config
     from biliup.app import PluginInfo
     from biliup import __version__
-    res = {'version': __version__,}
+    res = {'version': __version__, }
     for key, value in context.items():  # 遍历删除不能被 json 序列化的键值对
         if isinstance(value, Config):
             continue
@@ -463,19 +491,23 @@ async def app_status(request):
 async def pre_archive(request):
     # path = 'cookies.json'
     # conf = Configuration.get_or_none(Configuration.key == 'bilibili-cookies')
-    db = request['db']
-    confs = db.scalars(
-        select(Configuration).where(Configuration.key == 'bilibili-cookies'))
+    with SessionLocal() as db:
+        confs = db.scalars(
+            select(Configuration).where(Configuration.key == 'bilibili-cookies'))
     # if conf is not None:
     #     path = conf.value
-    for conf in confs:
-        path = conf.value
-        try:
-            config.load_cookies(path)
-            cookies = config.data['user']['cookies']
-            return web.json_response(BiliBili.tid_archive(cookies))
-        except:
-            continue
+        for conf in confs:
+            path = conf.value
+            try:
+                config.load_cookies(path)
+                cookies = config.data['user']['cookies']
+                res = BiliBili.tid_archive(cookies)
+                if res['code'] != 0:
+                    continue
+                return web.json_response(res)
+            except:
+                logger.exception('pre_archive')
+                continue
     return web.json_response({"status": 500, 'error': "无可用 cookie 文件"}, status=500)
 
 
@@ -492,7 +524,19 @@ async def myinfo(request):
 
 @routes.get('/bili/proxy')
 async def proxy(request):
-    return web.Response(body=requests.get(request.query['url']).content)
+    url = unquote(request.query['url'])
+    parsed_url = urlparse(url)
+
+    if not parsed_url.hostname or not parsed_url.hostname.endswith('.hdslb.com'):
+        return web.HTTPForbidden(reason="Access to the requested domain is forbidden")
+
+    async with ClientSession() as session:
+        try:
+            async with session.get(url) as response:
+                content = await response.read()
+                return web.Response(body=content, status=response.status)
+        except Exception as e:
+            return web.HTTPBadRequest(reason=str(e))
 
 
 def find_all_folders(directory):
@@ -504,12 +548,6 @@ def find_all_folders(directory):
 
 
 async def service(args):
-    try:
-        from importlib.resources import files
-    except ImportError:
-        # Try backported to PY<37 `importlib_resources`.
-        from importlib_resources import files
-
     app = web.Application()
     app.add_routes([
         web.get('/api/check_tag', tag_check),
@@ -522,28 +560,28 @@ async def service(args):
         web.get('/api/login_by_sms', sms_login),
         web.post('/api/send_sms', sms_send),
         web.get('/api/save', save_config),
-        web.get('/api/get_qrcode', qrcode_get),
-        web.post('/api/login_by_qrcode', qrcode_login),
+        # web.get('/api/get_qrcode', qrcode_get),
+        # web.post('/api/login_by_qrcode', qrcode_login),
         web.get('/api/archive_pre', pre_archive),
         web.get('/', root_handler)
     ])
-    routes.static('/static', '.', show_index=True)
+    routes.static('/static', '.', show_index=False)
     app.add_routes(routes)
     if args.static_dir:
         app.add_routes([web.static('/', args.static_dir, show_index=False)])
     else:
         # res = [web.static('/', files('biliup.web').joinpath('public'))]
         res = []
-        for fdir in pathlib.Path(files('biliup.web').joinpath('public')).glob('*.html'):
+        for fdir in pathlib.Path(files('biliup.web').joinpath('public')).glob('**/*.html'):
             fname = fdir.relative_to(files('biliup.web').joinpath('public'))
 
             def _copy(fname):
                 async def static_view(request):
-                    return web.FileResponse(files('biliup.web').joinpath('public/' + str(fname)))
+                    return web.FileResponse(files('biliup.web').joinpath('public').joinpath(fname))
 
                 return static_view
 
-            res.append(web.get('/' + str(fname.with_suffix('')), _copy(fname)))
+            res.append(web.get('/' + str(fname.with_suffix('')).replace('\\', '/'), _copy(fname)))
             # res.append(web.static('/'+fdir.replace('\\', '/'), files('biliup.web').joinpath('public/'+fdir)))
         res.append(web.static('/', files('biliup.web').joinpath('public')))
         app.add_routes(res)
@@ -575,15 +613,8 @@ async def service(args):
     return runner
 
 
-# @web.middleware
-# async def get_session(request, handler):
-#
-#         resp = await handler(request)
-#     return resp
-
-
 async def handle_404(request):
-    return web.HTTPFound('404')
+    return web.FileResponse(files('biliup.web').joinpath('public').joinpath('404.html'))
 
 
 async def handle_500(request):
@@ -594,10 +625,7 @@ def create_error_middleware(overrides):
     @web.middleware
     async def error_middleware(request, handler):
         try:
-            """ 中间件，用来在请求结束时关闭对应线程会话 """
-            with SessionLocal() as db:
-                request['db'] = db
-                return await handler(request)
+            return await handler(request)
         except web.HTTPException as ex:
             override = overrides.get(ex.status)
             if override:
@@ -612,11 +640,24 @@ def create_error_middleware(overrides):
 
 
 def setup_middlewares(app):
+    @web.middleware
+    async def file_type_check_middleware(request, handler):
+        allowed_extensions = {'.mp4', '.flv', '.3gp', '.webm', '.mkv', '.ts', '.xml', '.log'}
+
+        if request.path.startswith('/static/'):
+            filename = request.match_info.get('filename')
+            if filename:
+                extension = '.' + filename.split('.')[-1]
+                if extension not in allowed_extensions:
+                    return web.HTTPForbidden(reason="File type not allowed")
+        return await handler(request)
+
     error_middleware = create_error_middleware({
         404: handle_404,
         500: handle_500,
     })
     app.middlewares.append(error_middleware)
+    app.middlewares.append(file_type_check_middleware)
 
 
 def log_startup(host, port) -> None:

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship, DeclarativeBase
 logger = logging.getLogger('biliup')
 
 
+# FIXME: 不应该在 stop 和 --version 时创建文件夹
 def get_path(*other):
     """获取数据文件绝对路径"""
     dir_path = Path.cwd().joinpath("data")
@@ -111,7 +112,8 @@ class UploadStreamers(BaseModel):
     title: Mapped[str] = mapped_column(
         nullable=True)  # 自定义标题的时间格式, {title}代表当场直播间标题 {streamer}代表在本config里面设置的主播名称 {url}代表设置的该主播的第一条直播间链接
     tid: Mapped[int] = mapped_column(nullable=True)  # 投稿分区码,171为电子竞技分区
-    copyright: Mapped[int] = mapped_column(nullable=True)  # 1为自制
+    copyright: Mapped[int] = mapped_column(nullable=True)  # 1为自制 2转载
+    copyright_source: Mapped[str] = mapped_column(nullable=True)  # 转载来源
     cover_path: Mapped[str] = mapped_column(nullable=True)  # 封面路径
     # 支持strftime, {title}, {streamer}, {url}占位符。
     description = mapped_column(TEXT(), nullable=True)  # 视频简介
@@ -144,6 +146,7 @@ class LiveStreamers(BaseModel):
     uploadstreamers: Mapped[UploadStreamers] = relationship(back_populates="livestreamers")
     format: Mapped[str] = mapped_column(nullable=True)  # 视频格式
     preprocessor = mapped_column(JSON(), nullable=True)  # 开始下载直播时触发
+    segment_processor = mapped_column(JSON(), nullable=True)  # 分段时触发
     downloaded_processor = mapped_column(JSON(), nullable=True)  # 准备上传直播时触发
     postprocessor = mapped_column(JSON(), nullable=True)  # 上传完成后触发
     opt_args = mapped_column(JSON(), nullable=True)  # ffmpeg参数

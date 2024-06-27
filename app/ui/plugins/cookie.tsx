@@ -47,6 +47,7 @@ const Cookie: React.FC<Props> = (props) => {
                     }}
                     optionList={list}
                     extraText="只支持「biliup-rs」生成的文件。当与上一个配置项同时存在时，将优先使用文件。"
+                    showClear={true}
                 />
                 <Form.Input
                     field="user.douyin_cookie"
@@ -59,6 +60,7 @@ const Cookie: React.FC<Props> = (props) => {
                             Cookie 填入。
                         </div>
                     }
+                    placeholder="__ac_nonce=none;__ac_signature=none;sessionid=none;"
                     label="抖音 Cookie（douyin_cookie）"
                     style={{ width: "100%" }}
                     fieldStyle={{
@@ -100,7 +102,7 @@ const Cookie: React.FC<Props> = (props) => {
                             <br />
                             <code
                                 style={{ color: "blue" }}
-                            >{`document.cookie.split("; ").find(item={'>'}item.startsWith("auth-token="))?.split("=")[1]`}</code>
+                            >{`document.cookie.split("; ").find(item => item.startsWith("auth-token="))?.split("=")[1]`}</code>
                             <br />
                             twitch_cookie&nbsp;需要在&nbsp;downloader=
                             &quot;ffmpeg&quot;&nbsp;时候才会生效。
